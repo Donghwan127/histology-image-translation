@@ -60,25 +60,24 @@ def build_transform(image_prep="no_resize"):
             transforms.RandomCrop((256, 256)),
             transforms.RandomHorizontalFlip(),
         ])
-    elif image_prep in ["resize_256", "resize_256x256"]:
-        T = transforms.Compose([
-            transforms.Resize((256, 256), interpolation=transforms.InterpolationMode.LANCZOS)
-        ])
     elif image_prep in ["resize_512", "resize_512x512"]:
         T = transforms.Compose([
             transforms.Resize((512, 512), interpolation=transforms.InterpolationMode.LANCZOS)
         ])
     elif image_prep == "no_resize":
-        T = transforms.Lambda(lambda x: x)
+        # 명시적으로 이미지를 그대로 반환하도록 설정
+        return transforms.Compose([]) 
     else:
-        raise NotImplementedError("transform is not Implemented.")
+        # 이 부분이 실행되지 않도록 입력되는 img_prep 문자열을 확인해야 합니다.
+        # train.py에서 "no_resize"를 보낸다면 위 elif에서 걸러집니다.
+        raise NotImplementedError(f"transform is not Implemented for {image_prep}")
 
     return T
 
 
 def get_mu_sigma(path, feat_model, transform=None):
     files = make_dataset(path, shuffle=True)
-    features = get_files_features(files, model=feat_model, num_workers=0, batch_size=256, device='cuda', mode="clean",
+    features = get_files_features(files, model=feat_model, num_workers=0, batch_size=64, device='cuda', mode="clean",
                                   custom_fn_resize=None, description="", fdir=None, verbose=True,
                                   custom_image_tranform=transform)
     mu, sigma = np.mean(features, axis=0), np.cov(features, rowvar=False)
@@ -87,7 +86,7 @@ def get_mu_sigma(path, feat_model, transform=None):
 
 def get_features(path, feat_model, transform=None):
     files = make_dataset(path, shuffle=True)
-    features = get_files_features(files, model=feat_model, num_workers=0, batch_size=128, device='cuda', mode="clean",
+    features = get_files_features(files, model=feat_model, num_workers=0, batch_size=512, device='cuda', mode="clean",
                                   custom_fn_resize=None, description="", fdir=None, verbose=True,
                                   custom_image_tranform=transform)
     return features
@@ -131,81 +130,43 @@ def calculate_dino(data_path, test_path, net_dino):
     return np.mean(l_dino_scores)
 
 
-def load_seg_feature(img_path, seg_dir):
-    """
-    Load segmentation feature corresponding to image path
-    
-    Args:
-        img_path: e.g., "validA/image_001.png"
-        seg_dir: e.g., "valid_seg_A"
-    Returns:
-        feature: (10,) numpy array
-    """
-    if seg_dir is None:
-        return np.zeros(10, dtype=np.float32)
-    
-    basename = os.path.splitext(os.path.basename(img_path))[0]
-    feat_path = os.path.join(seg_dir, f"{basename}.npy")
-    
-    if os.path.exists(feat_path):
-        feature = np.load(feat_path).astype(np.float32)
-    else:
-        # Feature가 없으면 zero feature 반환
-        print(f"⚠️ Seg feature not found: {feat_path}, using zeros")
-        feature = np.zeros(10, dtype=np.float32)
-    
-    return feature
-
-
-def evaluate(model, net_dino, img_path, fixed_emb, direction, fid_output_dir, img_prep, num_images, seg_folder=None):
-    """
-    Evaluate model on validation set
-    
-    Args:
-        model: Diffusion_FFPE model
-        net_dino: DINO structure loss network
-        img_path: List of image paths
-        fixed_emb: Text embeddings (B, 77, 1024)
-        direction: "a2b" or "b2a"
-        fid_output_dir: Output directory for generated images
-        img_prep: Image preprocessing method
-        num_images: Number of images to evaluate (-1 for all)
-        seg_folder: ✅ Segmentation feature folder (e.g., "valid_seg_A")
-    
-    Returns:
-        l_dino_scores: List of DINO-Struct scores
-    """
+def evaluate(model, net_dino, img_paths, fixed_emb, direction, fid_output_dir, img_prep, num_images, accelerator):
     l_dino_scores = []
     T_val = build_transform(img_prep)
+    
+    if num_images > 0:
+        img_paths = img_paths[:num_images]
 
-    for idx, input_img_path in enumerate(tqdm(img_path, desc="Evaluating")):
-        if idx > num_images > 0:
-            break
-        
-        file_name = os.path.join(fid_output_dir, os.path.basename(input_img_path).replace(".png", ".jpg"))
+    my_img_paths = img_paths[accelerator.process_index::accelerator.num_processes]
+
+    model.eval()
+    for input_img_path in tqdm(my_img_paths, desc=f"GPU {accelerator.process_index} Evaluating"):
+        # 파일 저장 경로 설정
+        file_name = os.path.join(fid_output_dir, os.path.basename(input_img_path).replace(".png", ".jpg").replace(".tif", ".jpg"))
         
         with torch.no_grad():
-            # Load and preprocess image
-            input_img = T_val(Image.open(input_img_path).convert("RGB"))
-            img_a = transforms.ToTensor()(input_img)
-            img_a = transforms.Normalize([0.5], [0.5])(img_a).unsqueeze(0).cuda()
+            # 1. PIL 이미지 오픈
+            raw_img = Image.open(input_img_path).convert("RGB")
             
-            # ✅ Load segmentation feature
-            if seg_folder is not None:
-                seg_feat = load_seg_feature(input_img_path, seg_folder)
-                seg_feat = torch.from_numpy(seg_feat).unsqueeze(0).cuda()
-            else:
-                seg_feat = None
+            # 2. build_transform 적용 (리사이즈 등)
+            input_img = T_val(raw_img)
             
-            # Generate fake image
-            eval_fake_b = model(img_a, direction, fixed_emb[0:1], seg_features=seg_feat)  # ✅
-            eval_fake_b_pil = transforms.ToPILImage()(eval_fake_b[0] * 0.5 + 0.5)
+            # 3. Tensor 변환 및 정규화 (모델 입력용)
+            img_a = transforms.ToTensor()(input_img).unsqueeze(0).to(accelerator.device)
+            img_a = transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])(img_a) # 3채널 정규화 확인
+            
+            # 4. 모델 호출
+            # 기존 코드에서 fixed_emb[0:1]를 사용하는데, 배치 사이즈에 맞춰 repeat이 필요할 수 있습니다.
+            eval_fake_b = model(img_a, direction, fixed_emb[0:1])
+            
+            # 5. 결과 저장 (Tensor -> PIL)
+            output_tensor = eval_fake_b[0].float().cpu() * 0.5 + 0.5
+            eval_fake_b_pil = transforms.ToPILImage()(output_tensor.clamp(0, 1))
             eval_fake_b_pil.save(file_name)
             
-            # Compute DINO score
-            a = net_dino.preprocess(input_img).unsqueeze(0).cuda()
-            b = net_dino.preprocess(eval_fake_b_pil).unsqueeze(0).cuda()
-            dino_ssim = net_dino.calculate_global_ssim_loss(a, b).item()
+            # 6. DINO Score 계산
+            dino_ssim = net_dino.calculate_global_ssim_loss(eval_fake_b, img_a).item()
             l_dino_scores.append(dino_ssim)
-
+    
+    accelerator.wait_for_everyone()
     return l_dino_scores

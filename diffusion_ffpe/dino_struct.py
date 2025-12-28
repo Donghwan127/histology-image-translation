@@ -171,19 +171,54 @@ class VitExtractor:
 
 
 class DinoStructureLoss:
-    def __init__(self, ):
+    def __init__(self):
         self.extractor = VitExtractor(model_name="dino_vitb8", device="cuda")
+        # DINO가 기대하는 정규화 값 (ImageNet 기준)
+        self.mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).cuda()
+        self.std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).cuda()
+        
+        # PIL 이미지용 전처리 (evaluate 시 사용)
         self.preprocess = torchvision.transforms.Compose([
             torchvision.transforms.Resize(224),
             torchvision.transforms.ToTensor(),
             torchvision.transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
         ])
 
+    def _normalize_tensor(self, tensor):
+        """
+        [-1, 1] 범위의 텐서를 [0, 1]로 변환 후 ImageNet 정규화 적용
+        """
+        # 1. [-1, 1] -> [0, 1]
+        tensor = (tensor + 1.0) / 2.0
+        # 2. 224x224 리사이즈 (DINO 최적 성능을 위해 권장)
+        if tensor.shape[-1] != 224:
+            tensor = F.interpolate(tensor, size=(224, 224), mode='bilinear', align_corners=False)
+        # 3. ImageNet 정규화 적용
+        return (tensor - self.mean) / self.std
+
     def calculate_global_ssim_loss(self, outputs, inputs):
+        """
+        outputs, inputs: [-1, 1] 범위의 배치 텐서 (B, 3, H, W)
+        """
         loss = 0.0
-        for a, b in zip(inputs, outputs):  # avoid memory limitations
+        # 메모리 효율을 위해 배치 단위로 루프 (train.py에서 전달된 inputs/outputs 처리)
+        for a, b in zip(inputs, outputs):
+            # 1단계: 배치 차원 추가 (1, 3, H, W)
+            a_img = a.unsqueeze(0)
+            b_img = b.unsqueeze(0)
+            
+            # 2단계: DINO 전용 정규화 적용 (핵심 수정 사항)
+            a_norm = self._normalize_tensor(a_img)
+            b_norm = self._normalize_tensor(b_img)
+
             with torch.no_grad():
-                target_keys_self_sim = self.extractor.get_keys_self_sim_from_input(a.unsqueeze(0), layer_num=11)
-            keys_ssim = self.extractor.get_keys_self_sim_from_input(b.unsqueeze(0), layer_num=11)
+                # 원본 이미지(Target)에서 구조 맵 추출
+                target_keys_self_sim = self.extractor.get_keys_self_sim_from_input(a_norm, layer_num=11)
+            
+            # 생성 이미지(Fake)에서 구조 맵 추출
+            keys_ssim = self.extractor.get_keys_self_sim_from_input(b_norm, layer_num=11)
+            
+            # 두 구조 간의 MSE Loss 계산
             loss += F.mse_loss(keys_ssim, target_keys_self_sim)
-        return loss
+            
+        return loss / len(inputs) # 평균 로스로 반환

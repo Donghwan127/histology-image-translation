@@ -5,7 +5,7 @@ import torch.nn as nn
 from vision_aided_loss.cvmodel import Conch
 from torch.nn import init
 from peft import LoraConfig
-from diffusers import DDPMScheduler, AutoencoderKL, UNet2DConditionModel
+from diffusers import DDPMScheduler, AutoencoderKL, UNet2DConditionModel, ControlNetModel
 from transformers import AutoTokenizer, CLIPTextModel
 from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
 
@@ -295,8 +295,17 @@ class Diffusion_FFPE(nn.Module):
             self.vae_enc = VAE_encode(vae_a2b, vae_b2a=vae_b2a)
             self.vae_dec = VAE_decode(vae_a2b, vae_b2a=vae_b2a)
 
+        # 1. 먼저 순수한 UNet을 불러옵니다 (LoRA 적용 전)
+        from diffusers import UNet2DConditionModel
+        base_unet = UNet2DConditionModel.from_pretrained(model_path, subfolder="unet")
+        
+        # 2. 이 순수한 상태에서 ControlNet을 생성합니다 (이러면 에러가 절대 안 납니다!)
+        self.controlnet = ControlNetModel.from_unet(base_unet)
+        del base_unet # 메모리 확보를 위해 삭제
+        
+        # 3. 그 다음, 기존 방식대로 LoRA가 적용된 UNet을 초기화합니다.
         self.unet = initialize_unet(lora_rank_unet, model_path)
-
+        
         self.conch = Conch()
         self.conch.eval()
         self.conch.requires_grad_(False)
@@ -317,62 +326,75 @@ class Diffusion_FFPE(nn.Module):
             self.load_ckpt_from_state_dict(pretrained_sd)
 
     def get_trainable_params(self):
-        # add all unet parameters
+        # 1. UNet 관련 파라미터 (conv_in + LoRA)
         params_gen = list(self.unet.conv_in.parameters())
         self.unet.conv_in.requires_grad_(True)
 
         for n, p in self.unet.named_parameters():
             if "lora" in n and "default" in n and 'conv_in' not in n:
-                assert p.requires_grad
+                p.requires_grad = True
                 params_gen.append(p)
 
-        # add all vae_a2b parameters
-        vae_a2b = self.vae_enc.vae
-        for n, p in vae_a2b.named_parameters():
-            if "lora" in n and "vae_skip" in n and 'decoder.skip_conv' not in n:
-                assert p.requires_grad
-                params_gen.append(p)
+        # 2. VAE 파라미터 (A2B, B2A의 LoRA 및 Skip Conv)
+        for _vae in [self.vae_enc.vae, self.vae_enc.vae_b2a]:
+            for n, p in _vae.named_parameters():
+                if "lora" in n and "vae_skip" in n and 'decoder.skip_conv' not in n:
+                    p.requires_grad = True
+                    params_gen.append(p)
+            
+            # Skip Connections 가중치 추가
+            for i in range(1, 5):
+                conv_layer = getattr(_vae.decoder, f"skip_conv_{i}")
+                conv_layer.requires_grad_(True)
+                params_gen += list(conv_layer.parameters())
 
-        params_gen = params_gen + list(vae_a2b.decoder.skip_conv_1.parameters())
-        params_gen = params_gen + list(vae_a2b.decoder.skip_conv_2.parameters())
-        params_gen = params_gen + list(vae_a2b.decoder.skip_conv_3.parameters())
-        params_gen = params_gen + list(vae_a2b.decoder.skip_conv_4.parameters())
-
-        # add all vae_b2a parameters
-        vae_b2a = self.vae_enc.vae_b2a
-        for n, p in vae_b2a.named_parameters():
-            if "lora" in n and "vae_skip" in n and 'decoder.skip_conv' not in n:
-                assert p.requires_grad
-                params_gen.append(p)
-        params_gen = params_gen + list(vae_b2a.decoder.skip_conv_1.parameters())
-        params_gen = params_gen + list(vae_b2a.decoder.skip_conv_2.parameters())
-        params_gen = params_gen + list(vae_b2a.decoder.skip_conv_3.parameters())
-        params_gen = params_gen + list(vae_b2a.decoder.skip_conv_4.parameters())
-
+        # 3. CONCH Projector 파라미터
+        self.conch_proj.requires_grad_(True)
         params_gen += list(self.conch_proj.parameters())
 
+        # 4. ControlNet 파라미터 (가장 중요)
+        # ControlNet의 모든 파라미터를 학습 가능하게 설정합니다.
+        self.controlnet.requires_grad_(True)
+        params_gen += list(self.controlnet.parameters())
+        
         return params_gen
 
     def load_ckpt_from_state_dict(self, sd):
+        # 1. UNet의 입력 레이어(conv_in) 로드
         self.unet.conv_in.load_state_dict(sd['unet_conv_in'], strict=True)
+        
+        # 2. UNet의 LoRA 어댑터 가중치 로드 (Encoder, Decoder, Others)
         for n, p in self.unet.named_parameters():
-            name_sd = n.replace(".default_encoder.weight", ".weight")
+            # Encoder LoRA
             if "lora" in n and "default_encoder" in n:
+                name_sd = n.replace(".default_encoder.weight", ".weight")
                 p.data.copy_(sd["sd_encoder"][name_sd])
-        for n, p in self.unet.named_parameters():
-            name_sd = n.replace(".default_decoder.weight", ".weight")
-            if "lora" in n and "default_decoder" in n:
+            # Decoder LoRA
+            elif "lora" in n and "default_decoder" in n:
+                name_sd = n.replace(".default_decoder.weight", ".weight")
                 p.data.copy_(sd["sd_decoder"][name_sd])
-        for n, p in self.unet.named_parameters():
-            name_sd = n.replace(".default_others.weight", ".weight")
-            if "lora" in n and "default_others" in n:
+            # Other LoRA (Middle blocks 등)
+            elif "lora" in n and "default_others" in n:
+                name_sd = n.replace(".default_others.weight", ".weight")
                 p.data.copy_(sd["sd_other"][name_sd])
 
+        # 3. VAE Encoder & Decoder 가중치 로드
         self.vae_enc.load_state_dict(sd["sd_vae_enc"], strict=True)
         self.vae_dec.load_state_dict(sd["sd_vae_dec"], strict=True)
-        self.conch_proj.load_state_dict(sd["sd_conch_proj"], strict=True)
+        
+        # 4. CONCH Projector 가중치 로드
+        if "sd_conch_proj" in sd:
+            self.conch_proj.load_state_dict(sd["sd_conch_proj"], strict=True)
 
-    def forward(self, x, direction, text_emb):
+        # 5. ✅ ControlNet 가중치 로드 (핵심 추가 사항)
+        # 처음 ControlNet을 추가한 직후에는 sd에 이 키가 없을 수 있으므로 체크합니다.
+        if "sd_controlnet" in sd:
+            self.controlnet.load_state_dict(sd["sd_controlnet"], strict=True)
+            print("✅ [Success] ControlNet weights loaded from state_dict.")
+        else:
+            print("⚠️ [Warning] sd_controlnet not found in checkpoint. Starting with initialized weights.")
+
+    def forward(self, x, direction, text_emb, control_img):
         assert direction in ["a2b", "b2a"]
         batch_size = x.shape[0]
 
@@ -414,10 +436,20 @@ class Diffusion_FFPE(nn.Module):
         # ----------------------------------------
         # 4) UNet forward
         # ----------------------------------------
+        # control_img로부터 residual 정보를 추출합니다.
+        down_block_res, mid_block_res = self.controlnet(
+            x_enc,
+            timesteps,
+            encoder_hidden_states=text_combined,
+            controlnet_cond=control_img, # Canny edge 이미지
+            return_dict=False,
+        )
         model_pred = self.unet(
             x_enc,
             timesteps,
-            encoder_hidden_states=text_combined
+            encoder_hidden_states=text_combined,
+            down_block_additional_residuals=down_block_res,
+            mid_block_additional_residual=mid_block_res
         ).sample
 
         # ----------------------------------------
